@@ -1,0 +1,400 @@
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import tkinter as tk
+from tkinter import filedialog, mes        try:
+        gain_table = pd.DataFrame(index=long_windows, columns=short_windows, dtype=float)
+        trade_count_table = pd.DataFrame(index=long_windows, columns=short_windows, dtype=int)
+        result_cache = {}
+        
+        # Calculate total combinations for progress tracking
+        total_combinations = len(long_windows) * len(short_windows)
+        completed_combinations = 0
+        
+        for long_ma in long_windows:
+            for short_ma in short_windows:
+                # Update progress bar
+                if progress_var is not None and root is not None:
+                    completed_combinations += 1
+                    progress_percent = (completed_combinations / total_combinations) * 100
+                    progress_var.set(progress_percent)
+                    root.update_idletasks()
+                    
+                if short_ma >= long_ma:
+                    gain_table.at[long_ma, short_ma] = np.nan
+                    trade_count_table.at[long_ma, short_ma] = np.nan
+                    continuerom tkinter import ttk
+import threading
+import pandas as pd
+import numpy as np
+from itertools import product
+import os
+from multiprocessing import Pool, cpu_count
+from functools import partial
+
+def load_data(file_path):
+    try:
+        df = pd.read_csv(file_path, header=None, names=['Date', 'Price'])
+        df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+        df['Price'] = df['Price'].replace(r'[\$,]', '', regex=True).astype(float)
+        df = df.dropna().reset_index(drop=True)
+        if df.empty:
+            raise ValueError("DataFrame is empty after cleaning.")
+        return df
+    except Exception as e:
+        print(f"Error loading file: {e}")
+        return None
+
+def calculate_moving_averages(df, short_window, long_window):
+    df = df.copy()
+    df['SMA'] = df['Price'].rolling(window=short_window).mean()
+    df['LMA'] = df['Price'].rolling(window=long_window).mean()
+    df['SMA_Slope'] = df['SMA'].diff()
+    df['LMA_Slope'] = df['LMA'].diff()
+    return df
+
+def generate_signals(df):
+    df = df.copy()
+    df['Signal'] = 0
+    for i in range(1, len(df)):
+        prev_sma = df['SMA'].iloc[i-1]
+        prev_lma = df['LMA'].iloc[i-1]
+        curr_sma = df['SMA'].iloc[i]
+        curr_lma = df['LMA'].iloc[i]
+        sma_slope = df['SMA_Slope'].iloc[i]
+        lma_slope = df['LMA_Slope'].iloc[i]
+        if (prev_sma <= prev_lma and curr_sma > curr_lma and sma_slope >= 0 and lma_slope >= 0):
+            df.loc[i, 'Signal'] = 1
+        elif (prev_sma >= prev_lma and curr_sma < curr_lma and sma_slope <= 0 and lma_slope <= 0):
+            df.loc[i, 'Signal'] = -1
+    return df
+
+def calculate_wealth(df, initial_investment=10000):
+    cash = initial_investment
+    shares = 0
+    position = 0
+    trades = []
+    for i in range(len(df)):
+        signal = df['Signal'].iloc[i]
+        price = df['Price'].iloc[i]
+        if signal == 1 and position == 0:
+            shares = cash / price
+            cash = 0
+            position = 1
+            trades.append(('Buy', df['Date'].iloc[i], price))
+        elif signal == -1 and position == 1:
+            cash = shares * price
+            shares = 0
+            position = 0
+            trades.append(('Sell', df['Date'].iloc[i], price))
+    if position == 1:
+        cash = shares * df['Price'].iloc[-1]
+        trades.append(('Sell', df['Date'].iloc[-1], df['Price'].iloc[-1]))
+    final_wealth = cash
+    return final_wealth, trades
+
+def evaluate_combination(params, df, initial_investment):
+    short_window, long_window = params
+    if short_window >= long_window:
+        return short_window, long_window, 0, []
+    df_copy = df.copy()
+    df_copy = calculate_moving_averages(df_copy, short_window, long_window)
+    df_copy = df_copy.dropna().reset_index(drop=True)
+    if df_copy.empty:
+        return short_window, long_window, 0, []
+    df_copy = generate_signals(df_copy)
+    final_wealth, trades = calculate_wealth(df_copy, initial_investment)
+    return short_window, long_window, final_wealth, trades
+
+def optimize_moving_averages(df, short_windows, long_windows, initial_investment=10000):
+    best_wealth = 0
+    best_short_window = 0
+    best_long_window = 0
+    best_trades = []
+    combinations = list(product(short_windows, long_windows))
+    func = partial(evaluate_combination, df=df, initial_investment=initial_investment)
+    with Pool(processes=cpu_count()) as pool:
+        results = pool.map(func, combinations)
+    for short_window, long_window, wealth, trades in results:
+        if wealth > best_wealth:
+            best_wealth = wealth
+            best_short_window = short_window
+            best_long_window = long_window
+            best_trades = trades
+    return best_short_window, best_long_window, best_wealth, best_trades
+
+
+# --- GUI Section ---
+def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min, long_max, progress_var=None, root=None):
+    df = load_data(file_path)
+    if df is None:
+        messagebox.showerror("Error", "Could not load data from CSV. Please check the file format and contents.")
+        return
+    # Filter by date
+    df = df[(df['Date'] >= pd.to_datetime(start_date)) & (df['Date'] <= pd.to_datetime(end_date))].reset_index(drop=True)
+    if df.empty:
+        messagebox.showerror("Error", "No data in selected date range.")
+        return
+    short_windows = range(short_min, short_max + 1)
+    long_windows = range(long_min, long_max + 1)
+    initial_investment = 10000
+    def annualized_gain(initial, final, start_date, end_date):
+        num_days = (end_date - start_date).days
+        num_years = num_days / 365.25
+        if num_years > 0:
+            return ((final / initial) ** (1 / num_years) - 1) * 100
+        else:
+            return 0.0
+
+    try:
+        gain_table = pd.DataFrame(index=long_windows, columns=short_windows, dtype=float)
+        trade_count_table = pd.DataFrame(index=long_windows, columns=short_windows, dtype=int)
+        result_cache = {}
+        
+        # Calculate total combinations for progress tracking
+        total_combinations = len(long_windows) * len(short_windows)
+        completed_combinations = 0
+        
+        for long_ma in long_windows:
+            for short_ma in short_windows:
+                # Update progress bar
+                if progress_var is not None and root is not None:
+                    completed_combinations += 1
+                    progress_percent = (completed_combinations / total_combinations) * 100
+                    progress_var.set(progress_percent)
+                    root.update_idletasks()
+                    
+                if short_ma >= long_ma:
+                    gain_table.at[long_ma, short_ma] = np.nan
+                    trade_count_table.at[long_ma, short_ma] = np.nan
+                    continue
+                df_tmp = calculate_moving_averages(df.copy(), short_ma, long_ma)
+                df_tmp = df_tmp.dropna().reset_index(drop=True)
+                if df_tmp.empty:
+                    gain_table.at[long_ma, short_ma] = np.nan
+                    trade_count_table.at[long_ma, short_ma] = np.nan
+                    result_cache[(short_ma, long_ma)] = (0, [])
+                    continue
+                df_tmp = generate_signals(df_tmp)
+                final_wealth, trades = calculate_wealth(df_tmp, initial_investment)
+                if trades:
+                    first_trade_date = trades[0][1]
+                    last_trade_date = trades[-1][1]
+                    annualized_pct = annualized_gain(initial_investment, final_wealth, first_trade_date, last_trade_date)
+                    trade_count = len(trades)
+                else:
+                    annualized_pct = np.nan
+                    trade_count = np.nan
+                gain_table.at[long_ma, short_ma] = annualized_pct
+                trade_count_table.at[long_ma, short_ma] = trade_count
+                result_cache[(short_ma, long_ma)] = (final_wealth, trades)
+        gain_table.to_csv("annualized_gain_table.csv")
+        trade_count_table.to_csv("trade_count_table.csv")
+
+        best_wealth = 0
+        best_short = 0
+        best_long = 0
+        best_trades = []
+        for (short_ma, long_ma), (wealth, trades) in result_cache.items():
+            if wealth > best_wealth:
+                best_wealth = wealth
+                best_short = short_ma
+                best_long = long_ma
+                best_trades = trades
+        start_date_df = df['Date'].iloc[0]
+        end_date_df = df['Date'].iloc[-1]
+        buy_price = df['Price'].iloc[0]
+        sell_price = df['Price'].iloc[-1]
+        buy_and_hold_profit = (sell_price - buy_price) * (initial_investment / buy_price)
+        buy_and_hold_final = initial_investment + buy_and_hold_profit
+        annualized_profit_pct = annualized_gain(initial_investment, buy_and_hold_final, start_date_df, end_date_df)
+
+        # Buy and hold using first buy and last sell signals
+        df_signals = calculate_moving_averages(df.copy(), best_short, best_long)
+        df_signals = df_signals.dropna().reset_index(drop=True)
+        df_signals = generate_signals(df_signals)
+        buy_indices = df_signals.index[df_signals['Signal'] == 1].tolist()
+        sell_indices = df_signals.index[df_signals['Signal'] == -1].tolist()
+        if buy_indices and sell_indices:
+            first_buy_idx = buy_indices[0]
+            last_sell_idx = sell_indices[-1] if sell_indices[-1] > first_buy_idx else buy_indices[-1]
+            buy_date = df_signals['Date'].iloc[first_buy_idx]
+            buy_price_signal = df_signals['Price'].iloc[first_buy_idx]
+            sell_date = df_signals['Date'].iloc[last_sell_idx]
+            sell_price_signal = df_signals['Price'].iloc[last_sell_idx]
+            shares_signal = initial_investment / buy_price_signal
+            final_wealth_signal = shares_signal * sell_price_signal
+            profit_signal = final_wealth_signal - initial_investment
+            annualized_signal_pct = annualized_gain(initial_investment, final_wealth_signal, buy_date, sell_date)
+        else:
+            buy_date = sell_date = None
+            buy_price_signal = sell_price_signal = None
+            final_wealth_signal = profit_signal = annualized_signal_pct = 0.0
+
+        output = []
+        output.append(f"Start Date: {start_date_df.strftime('%Y-%m-%d')}")
+        output.append(f"End Date: {end_date_df.strftime('%Y-%m-%d')}")
+        output.append(f"Buy and Hold (Full Period):")
+        output.append(f"  Profit: ${buy_and_hold_profit:.2f}")
+        output.append(f"  Final Wealth: ${buy_and_hold_final:.2f}")
+        output.append(f"  Annualized % Gain: {annualized_profit_pct:.2f}%")
+        if buy_date and sell_date:
+            output.append(f"Buy and Hold (First Buy/Last Sell Signals):")
+            output.append(f"  Buy on {buy_date.strftime('%Y-%m-%d')} at ${buy_price_signal:.2f}")
+            output.append(f"  Sell on {sell_date.strftime('%Y-%m-%d')} at ${sell_price_signal:.2f}")
+            output.append(f"  Profit: ${profit_signal:.2f}")
+            output.append(f"  Final Wealth: ${final_wealth_signal:.2f}")
+            output.append(f"  Annualized % Gain: {annualized_signal_pct:.2f}%")
+        else:
+            output.append("Buy and Hold (First Buy/Last Sell Signals): Not enough signals to compute.")
+
+        # Optimized strategy annualized % profit
+        if best_trades:
+            first_trade_date = best_trades[0][1]
+            last_trade_date = best_trades[-1][1]
+            annualized_best_pct = annualized_gain(initial_investment, best_wealth, first_trade_date, last_trade_date)
+        else:
+            annualized_best_pct = 0.0
+
+        output.append(f"Best Short MA Window: {best_short} days")
+        output.append(f"Best Long MA Window: {best_long} days")
+        output.append(f"Final Wealth: ${best_wealth:.2f}")
+        output.append(f"Profit: ${best_wealth - initial_investment:.2f}")
+        output.append(f"Annualized % Gain (Optimized Strategy): {annualized_best_pct:.2f}%")
+        output.append(f"Number of Trades: {len(best_trades)}")
+        output.append("\nTrade Log:")
+        for trade in best_trades:
+            action, date, price = trade
+            output.append(f"{action} on {date.strftime('%Y-%m-%d')} at ${price:.2f}")
+
+        # Custom MA case: short=50, long=150
+        custom_short = 50
+        custom_long = 150
+        df_custom = df.copy()
+        df_custom = calculate_moving_averages(df_custom, custom_short, custom_long)
+        df_custom = df_custom.dropna().reset_index(drop=True)
+        if not df_custom.empty:
+            df_custom = generate_signals(df_custom)
+            custom_wealth, custom_trades = calculate_wealth(df_custom, initial_investment)
+            if custom_trades:
+                custom_first_trade_date = custom_trades[0][1]
+                custom_last_trade_date = custom_trades[-1][1]
+                annualized_custom_pct = annualized_gain(initial_investment, custom_wealth, custom_first_trade_date, custom_last_trade_date)
+            else:
+                annualized_custom_pct = 0.0
+            output.append(f"\n--- Custom MA Case: Short={custom_short} Long={custom_long} ---")
+            output.append(f"Final Wealth: ${custom_wealth:.2f}")
+            output.append(f"Profit: ${custom_wealth - initial_investment:.2f}")
+            output.append(f"Annualized % Gain (Custom MA): {annualized_custom_pct:.2f}%")
+            output.append(f"Number of Trades: {len(custom_trades)}")
+            output.append("Trade Log:")
+            for trade in custom_trades:
+                action, date, price = trade
+                output.append(f"{action} on {date.strftime('%Y-%m-%d')} at ${price:.2f}")
+        
+        # Reset progress bar when complete
+        if progress_var is not None and root is not None:
+            progress_var.set(0)
+            root.update_idletasks()
+            
+        messagebox.showinfo("Analysis Complete", "\n".join(output))
+    except Exception as e:
+        messagebox.showerror("Error during optimization", str(e))
+
+def launch_gui():
+    root = tk.Tk()
+    root.title("SPY Buy/Sell Strategy Analysis")
+    root.geometry("500x500")
+    
+    # Create progress bar variable and widget
+    progress_var = tk.DoubleVar()
+    progress_bar = ttk.Progressbar(root, variable=progress_var, maximum=100)
+    progress_bar.pack(pady=10, fill=tk.X)
+    
+    def show_heatmap():
+        import pandas as pd
+        import numpy as np
+        try:
+            gain_table = pd.read_csv("annualized_gain_table.csv", index_col=0)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load annualized_gain_table.csv: {e}")
+            return
+        fig, ax = plt.subplots(figsize=(10, 8))
+        # Define color bins and colormap
+        bounds = [6, 7, 8, 9, 10, gain_table.max().max()+1]
+        colors = ["#87CEEB", "#90EE90", "#FFFF00", "#FFD700", "#FF8C00", "#FF0000"]
+        cmap = mcolors.ListedColormap(colors)
+        norm = mcolors.BoundaryNorm(bounds, cmap.N)
+        im = ax.imshow(gain_table.values, aspect='auto', cmap=cmap, norm=norm, origin='lower')
+        ax.set_xlabel("Short duration simple moving average")
+        ax.set_ylabel("Longer duration simple moving average")
+        ax.set_title("Annualized Gain Heatmap")
+        ax.set_xticks(np.arange(len(gain_table.columns)))
+        ax.set_xticklabels(gain_table.columns)
+        ax.set_yticks(np.arange(len(gain_table.index)))
+        ax.set_yticklabels(gain_table.index)
+        plt.xticks(rotation=90)
+        # Add legend
+        from matplotlib.patches import Patch
+        legend_labels = [
+            "Cell Value between 6 and 7",
+            "Cell Value between 7 and 8",
+            "Cell Value between 8 and 9",
+            "Cell Value between 9 and 10",
+            "Cell Value > 10"
+        ]
+        legend_colors = colors
+        legend_patches = [Patch(color=legend_colors[i], label=legend_labels[i]) for i in range(len(legend_labels))]
+        ax.legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        plt.tight_layout()
+        plt.show()
+    
+    # Create entry widgets and other UI elements
+    file_path_var = tk.StringVar()
+    start_date_var = tk.StringVar()
+    end_date_var = tk.StringVar()
+    short_min_var = tk.IntVar(value=5)
+    short_max_var = tk.IntVar(value=100)
+    long_min_var = tk.IntVar(value=20)
+    long_max_var = tk.IntVar(value=200)
+
+    def browse_file():
+        filename = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
+        if filename:
+            file_path_var.set(filename)
+
+    tk.Label(root, text="Select CSV File:").pack(pady=5)
+    tk.Entry(root, textvariable=file_path_var, width=40).pack(pady=2)
+    tk.Button(root, text="Browse", command=browse_file).pack(pady=2)
+
+    tk.Label(root, text="Start Date (YYYY-MM-DD):").pack(pady=5)
+    tk.Entry(root, textvariable=start_date_var, width=20).pack(pady=2)
+    tk.Label(root, text="End Date (YYYY-MM-DD):").pack(pady=5)
+    tk.Entry(root, textvariable=end_date_var, width=20).pack(pady=2)
+
+    tk.Label(root, text="Short MA Range (min, max):").pack(pady=5)
+    tk.Entry(root, textvariable=short_min_var, width=10).pack(pady=2)
+    tk.Entry(root, textvariable=short_max_var, width=10).pack(pady=2)
+    tk.Label(root, text="Long MA Range (min, max):").pack(pady=5)
+    tk.Entry(root, textvariable=long_min_var, width=10).pack(pady=2)
+    tk.Entry(root, textvariable=long_max_var, width=10).pack(pady=2)
+
+    def run():
+        file_path = file_path_var.get()
+        start_date = start_date_var.get()
+        end_date = end_date_var.get()
+        short_min = short_min_var.get()
+        short_max = short_max_var.get()
+        long_min = long_min_var.get()
+        long_max = long_max_var.get()
+        if not file_path or not start_date or not end_date:
+            messagebox.showerror("Missing Input", "Please fill in all fields.")
+            return
+        threading.Thread(target=run_analysis, args=(file_path, start_date, end_date, short_min, short_max, long_min, long_max, progress_var, root)).start()
+
+    tk.Button(root, text="Run Analysis", command=run).pack(pady=20)
+    tk.Button(root, text="Show Heatmap", command=show_heatmap).pack(pady=10)
+    root.mainloop()
+
+if __name__ == "__main__":
+    launch_gui()
+   
