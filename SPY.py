@@ -1,15 +1,20 @@
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, Toplevel
 from tkinter import ttk
 import threading
 import pandas as pd
 import numpy as np
 from itertools import product
+import matplotlib.dates as mdates
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import os
 from multiprocessing import Pool, cpu_count
 from functools import partial
+
+# Global variable to store trades
+all_trades = []
 
 def load_data(file_path):
     try:
@@ -48,42 +53,99 @@ def generate_signals(df):
             df.loc[i, 'Signal'] = -1
     return df
 
-def calculate_wealth(df, initial_investment=10000):
+def calculate_wealth(df, initial_investment=10000, allow_short_selling=False, short_sell_only=False):
     cash = initial_investment
     shares = 0
-    position = 0
+    position = 0  # 0: no position, 1: long position, -1: short position
     trades = []
+    long_trades = []
+    short_trades = []
+    
     for i in range(len(df)):
         signal = df['Signal'].iloc[i]
         price = df['Price'].iloc[i]
-        if signal == 1 and position == 0:
+        date = df['Date'].iloc[i]
+        
+        # Long trades (Buy signal opens, Sell signal closes)
+        if not short_sell_only and signal == 1 and (position == 0 or (allow_short_selling and position == -1)):
+            if position == -1:  # Close short position if exists
+                profit = shares * (short_entry_price - price)  # Profit from short trade
+                cash += profit + shares * short_entry_price  # Return initial investment plus profit
+                short_trades.append(('Cover Short', date, price, profit))
+                shares = 0
+                position = 0
+            
+            # Open long position
             shares = cash / price
             cash = 0
             position = 1
-            trades.append(('Buy', df['Date'].iloc[i], price))
-        elif signal == -1 and position == 1:
+            long_trades.append(('Buy', date, price))
+            trades.append(('Buy', date, price))
+            
+        elif not short_sell_only and signal == -1 and position == 1:
+            # Close long position
+            profit = shares * price - shares * long_trades[-1][2]  # Calculate profit for this trade
             cash = shares * price
             shares = 0
             position = 0
-            trades.append(('Sell', df['Date'].iloc[i], price))
-    if position == 1:
-        cash = shares * df['Price'].iloc[-1]
-        trades.append(('Sell', df['Date'].iloc[-1], df['Price'].iloc[-1]))
+            long_trades.append(('Sell', date, price, profit))
+            trades.append(('Sell', date, price))
+            
+            # If short selling is allowed, open a short position
+            if allow_short_selling:
+                shares = cash / price  # Number of shares to short
+                short_entry_price = price
+                position = -1
+                short_trades.append(('Short Sell', date, price))
+                trades.append(('Short Sell', date, price))
+        
+        # Short sell only strategy - only open short positions on sell signals when we don't have a position
+        elif short_sell_only and allow_short_selling and signal == -1 and position == 0:
+            shares = cash / price  # Number of shares to short
+            short_entry_price = price
+            position = -1
+            short_trades.append(('Short Sell', date, price))
+            trades.append(('Short Sell', date, price))
+        
+        # Close short positions on buy signals in short sell only mode
+        elif short_sell_only and allow_short_selling and signal == 1 and position == -1:
+            profit = shares * (short_entry_price - price)  # Profit from short trade
+            cash += profit + shares * short_entry_price  # Return initial investment plus profit
+            short_trades.append(('Cover Short', date, price, profit))
+            trades.append(('Cover Short', date, price))
+            shares = 0
+            position = 0
+    
+    # Close any open positions at the end
+    final_price = df['Price'].iloc[-1]
+    final_date = df['Date'].iloc[-1]
+    
+    if position == 1:  # Long position
+        profit = shares * final_price - shares * long_trades[-1][2]
+        cash = shares * final_price
+        long_trades.append(('Sell', final_date, final_price, profit))
+        trades.append(('Sell', final_date, final_price))
+    elif position == -1:  # Short position
+        profit = shares * (short_entry_price - final_price)
+        cash += profit + shares * short_entry_price
+        short_trades.append(('Cover Short', final_date, final_price, profit))
+        trades.append(('Cover Short', final_date, final_price))
+    
     final_wealth = cash
-    return final_wealth, trades
+    return final_wealth, trades, long_trades, short_trades
 
-def evaluate_combination(params, df, initial_investment):
+def evaluate_combination(params, df, initial_investment, allow_short_selling=False, short_sell_only=False):
     short_window, long_window = params
     if short_window >= long_window:
-        return short_window, long_window, 0, []
+        return short_window, long_window, 0, [], [], []
     df_copy = df.copy()
     df_copy = calculate_moving_averages(df_copy, short_window, long_window)
     df_copy = df_copy.dropna().reset_index(drop=True)
     if df_copy.empty:
-        return short_window, long_window, 0, []
+        return short_window, long_window, 0, [], [], []
     df_copy = generate_signals(df_copy)
-    final_wealth, trades = calculate_wealth(df_copy, initial_investment)
-    return short_window, long_window, final_wealth, trades
+    final_wealth, trades, long_trades, short_trades = calculate_wealth(df_copy, initial_investment, allow_short_selling, short_sell_only)
+    return short_window, long_window, final_wealth, trades, long_trades, short_trades
 
 def save_results_with_metadata(results_df, filename, params):
     """
@@ -104,17 +166,26 @@ def save_results_with_metadata(results_df, filename, params):
         f.write(f"# Short MA range: {params['short_min']} to {params['short_max']}\n")
         f.write(f"# Long MA range: {params['long_min']} to {params['long_max']}\n")
         f.write(f"# Initial investment: ${params['initial_investment']:,.2f}\n")
+        f.write(f"# Allow short selling: {params['allow_short_selling']}\n")
+        if params['allow_short_selling'] == 'Y':
+            f.write(f"# Short sell optimisation only: {params['short_sell_only']}\n")
         f.write("# \n")
         
         if 'best_short' in params and 'best_long' in params:
             f.write(f"# Best combination: Short MA={params['best_short']}, Long MA={params['best_long']}, ")
             f.write(f"Annual Gain={params['best_gain']:.2f}%, Trades={params['best_trades']}\n")
+            
+            # Add short selling details if enabled
+            if params['allow_short_selling'] == 'Y':
+                if 'best_long_profit' in params and 'best_long_trade_count' in params:
+                    f.write(f"# Long trades: Profit=${params['best_long_profit']:.2f}, Count={params['best_long_trade_count']}\n")
+                if 'best_short_profit' in params and 'best_short_trade_count' in params:
+                    f.write(f"# Short trades: Profit=${params['best_short_profit']:.2f}, Count={params['best_short_trade_count']}\n")
         
         if 'buy_hold_gain' in params:
             f.write(f"# Buy-and-hold performance: Annual Gain={params['buy_hold_gain']:.2f}%\n")
         
         f.write("# \n")
-        f.write("# Reserved for future use\n")
         f.write("# Reserved for future use\n")
         f.write("# Reserved for future use\n")
         f.write("# \n")
@@ -142,7 +213,8 @@ def optimize_moving_averages(df, short_windows, long_windows, initial_investment
 
 
 # --- GUI Section ---
-def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min, long_max, progress_var=None, root=None, run_button=None, progress_bar=None):
+def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min, long_max, 
+               allow_short_selling=False, short_sell_only=False, progress_var=None, root=None, run_button=None, progress_bar=None):
     df = load_data(file_path)
     if df is None:
         messagebox.showerror("Error", "Could not load data from CSV. Please check the file format and contents.")
@@ -193,18 +265,26 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
                     result_cache[(short_ma, long_ma)] = (0, [])
                     continue
                 df_tmp = generate_signals(df_tmp)
-                final_wealth, trades = calculate_wealth(df_tmp, initial_investment)
+                final_wealth, trades, long_trades, short_trades = calculate_wealth(df_tmp, initial_investment, allow_short_selling, short_sell_only)
+                
                 if trades:
                     first_trade_date = trades[0][1]
                     last_trade_date = trades[-1][1]
                     annualized_pct = annualized_gain(initial_investment, final_wealth, first_trade_date, last_trade_date)
                     trade_count = len(trades)
+                    
+                    # Calculate separate metrics for long and short trades
+                    long_trade_count = len([t for t in trades if t[0] in ('Buy', 'Sell')])
+                    short_trade_count = len([t for t in trades if t[0] in ('Short Sell', 'Cover Short')])
                 else:
                     annualized_pct = np.nan
                     trade_count = np.nan
+                    long_trade_count = 0
+                    short_trade_count = 0
+                    
                 gain_table.at[long_ma, short_ma] = annualized_pct
                 trade_count_table.at[long_ma, short_ma] = trade_count
-                result_cache[(short_ma, long_ma)] = (final_wealth, trades)
+                result_cache[(short_ma, long_ma)] = (final_wealth, trades, long_trades, short_trades)
         
         # For backward compatibility, still save the individual tables
         gain_table.to_csv("annualized_gain_table.csv")
@@ -216,12 +296,37 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
         for long_ma in long_windows:
             for short_ma in short_windows:
                 if short_ma < long_ma:  # Skip invalid combinations
-                    combined_data.append({
+                    result_data = {
                         'long_ma': long_ma,
                         'short_ma': short_ma,
                         'annualized_gain': gain_table.at[long_ma, short_ma],
                         'trade_count': trade_count_table.at[long_ma, short_ma]
-                    })
+                    }
+                    
+                    # Add detailed trade information if available
+                    if (short_ma, long_ma) in result_cache:
+                        _, trades, long_trades, short_trades = result_cache[(short_ma, long_ma)]
+                        
+                        # Count long and short trades
+                        long_count = len([t for t in trades if t[0] == 'Buy'])
+                        short_count = len([t for t in trades if t[0] == 'Short Sell'])
+                        
+                        # Calculate gains for long and short trades separately if possible
+                        if long_trades and len(long_trades) > 0:
+                            long_trades_with_profit = [t for t in long_trades if len(t) > 3]
+                            if long_trades_with_profit:
+                                long_profit = sum(t[3] for t in long_trades_with_profit if len(t) > 3)
+                                result_data['long_profit'] = long_profit
+                                result_data['long_trade_count'] = long_count
+                        
+                        if allow_short_selling and short_trades and len(short_trades) > 0:
+                            short_trades_with_profit = [t for t in short_trades if len(t) > 3]
+                            if short_trades_with_profit:
+                                short_profit = sum(t[3] for t in short_trades_with_profit if len(t) > 3)
+                                result_data['short_profit'] = short_profit
+                                result_data['short_trade_count'] = short_count
+                    
+                    combined_data.append(result_data)
         
         # Create the combined DataFrame
         combined_results = pd.DataFrame(combined_data)
@@ -246,6 +351,8 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
             'long_min': long_min,
             'long_max': long_max,
             'initial_investment': initial_investment,
+            'allow_short_selling': 'Y' if allow_short_selling else 'N',
+            'short_sell_only': 'Y' if short_sell_only else 'N',
             'best_short': best_combination['short_ma'],
             'best_long': best_combination['long_ma'],
             'best_gain': best_combination['annualized_gain'],
@@ -253,19 +360,37 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
             'buy_hold_gain': buy_hold_annualized
         }
         
+        # Add short selling stats to metadata if enabled
+        if allow_short_selling:
+            if 'short_profit' in best_combination:
+                params_dict['best_short_profit'] = best_combination['short_profit']
+            if 'short_trade_count' in best_combination:
+                params_dict['best_short_trade_count'] = best_combination['short_trade_count']
+            if 'long_profit' in best_combination:
+                params_dict['best_long_profit'] = best_combination['long_profit']
+            if 'long_trade_count' in best_combination:
+                params_dict['best_long_trade_count'] = best_combination['long_trade_count']
+        
         # Save the combined results with metadata
         save_results_with_metadata(combined_results, "ma_strategy_results.csv", params_dict)
 
+        # Get the best combination parameters
+        best_short = best_combination['short_ma']
+        best_long = best_combination['long_ma']
         best_wealth = 0
-        best_short = 0
-        best_long = 0
         best_trades = []
-        for (short_ma, long_ma), (wealth, trades) in result_cache.items():
-            if wealth > best_wealth:
-                best_wealth = wealth
-                best_short = short_ma
-                best_long = long_ma
-                best_trades = trades
+        best_long_trades = []
+        best_short_trades = []
+        
+        # Find the cached results for this best combination
+        if (best_short, best_long) in result_cache:
+            cached_result = result_cache[(best_short, best_long)]
+            if len(cached_result) >= 2:
+                best_wealth = cached_result[0]
+                best_trades = cached_result[1]
+                if len(cached_result) >= 4:  # If we have long and short trades
+                    best_long_trades = cached_result[2]
+                    best_short_trades = cached_result[3]
         start_date_df = df['Date'].iloc[0]
         end_date_df = df['Date'].iloc[-1]
         buy_price = df['Price'].iloc[0]
@@ -299,6 +424,9 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
         output = []
         output.append(f"Start Date: {start_date_df.strftime('%Y-%m-%d')}")
         output.append(f"End Date: {end_date_df.strftime('%Y-%m-%d')}")
+        output.append(f"Allow Short Selling: {'Yes' if allow_short_selling else 'No'}")
+        if allow_short_selling:
+            output.append(f"Short Sell Optimisation Only: {'Yes' if short_sell_only else 'No'}")
         output.append(f"Buy and Hold (Full Period):")
         output.append(f"  Profit: ${buy_and_hold_profit:.2f}")
         output.append(f"  Final Wealth: ${buy_and_hold_final:.2f}")
@@ -321,16 +449,54 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
         else:
             annualized_best_pct = 0.0
 
+        output.append(f"\n--- Best Strategy Results ---")
         output.append(f"Best Short MA Window: {best_short} days")
         output.append(f"Best Long MA Window: {best_long} days")
         output.append(f"Final Wealth: ${best_wealth:.2f}")
         output.append(f"Profit: ${best_wealth - initial_investment:.2f}")
         output.append(f"Annualized % Gain (Optimized Strategy): {annualized_best_pct:.2f}%")
-        output.append(f"Number of Trades: {len(best_trades)}")
-        output.append("\nTrade Log:")
+        
+        # Add trade count information
+        total_trades = len(best_trades)
+        output.append(f"Number of Trades: {total_trades}")
+        
+        # If short selling is enabled, show separate statistics for long and short trades
+        if allow_short_selling:
+            # Count long and short trades
+            long_count = len([t for t in best_trades if t[0] in ('Buy', 'Sell')])
+            short_count = len([t for t in best_trades if t[0] in ('Short Sell', 'Cover Short')])
+            
+            # Add information about long and short trades to the output
+            output.append("\nTrade Breakdown:")
+            if short_sell_only:
+                output.append("  Strategy: Short Selling Only (Long trades skipped)")
+            else:
+                output.append(f"  Long Trades: {long_count}")
+            output.append(f"  Short Trades: {short_count}")
+            
+            # Calculate profits for long and short trades if available
+            long_profit = 0.0
+            short_profit = 0.0
+            
+            # Check if we have best_long_trades and best_short_trades with profit information
+            if best_long_trades and not short_sell_only:
+                long_trades_with_profit = [t for t in best_long_trades if len(t) > 3]
+                if long_trades_with_profit:
+                    long_profit = sum(t[3] for t in long_trades_with_profit)
+                    output.append(f"  Long Trade Profit: ${long_profit:.2f}")
+            
+            if best_short_trades:
+                short_trades_with_profit = [t for t in best_short_trades if len(t) > 3]
+                if short_trades_with_profit:
+                    short_profit = sum(t[3] for t in short_trades_with_profit)
+                    output.append(f"  Short Trade Profit: ${short_profit:.2f}")
+                
+        output.append("\nBest Strategy Trade Log:")
         for trade in best_trades:
-            action, date, price = trade
-            output.append(f"{action} on {date.strftime('%Y-%m-%d')} at ${price:.2f}")
+            # Handle trade tuples which may have 3 or 4 elements
+            if len(trade) >= 3:
+                action, date, price = trade[:3]
+                output.append(f"{action} on {date.strftime('%Y-%m-%d')} at ${price:.2f}")
 
         # Custom MA case: short=50, long=150
         custom_short = 50
@@ -340,7 +506,7 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
         df_custom = df_custom.dropna().reset_index(drop=True)
         if not df_custom.empty:
             df_custom = generate_signals(df_custom)
-            custom_wealth, custom_trades = calculate_wealth(df_custom, initial_investment)
+            custom_wealth, custom_trades, custom_long_trades, custom_short_trades = calculate_wealth(df_custom, initial_investment, allow_short_selling, short_sell_only)
             if custom_trades:
                 custom_first_trade_date = custom_trades[0][1]
                 custom_last_trade_date = custom_trades[-1][1]
@@ -351,11 +517,45 @@ def run_analysis(file_path, start_date, end_date, short_min, short_max, long_min
             output.append(f"Final Wealth: ${custom_wealth:.2f}")
             output.append(f"Profit: ${custom_wealth - initial_investment:.2f}")
             output.append(f"Annualized % Gain (Custom MA): {annualized_custom_pct:.2f}%")
-            output.append(f"Number of Trades: {len(custom_trades)}")
+            
+            # Add trade count information
+            total_custom_trades = len(custom_trades)
+            output.append(f"Number of Trades: {total_custom_trades}")
+            
+            # If short selling is enabled, show separate statistics for long and short trades
+            if allow_short_selling:
+                # Count long and short trades
+                long_count = len([t for t in custom_trades if t[0] in ('Buy', 'Sell')])
+                short_count = len([t for t in custom_trades if t[0] in ('Short Sell', 'Cover Short')])
+                
+                # Add information about long and short trades to the output
+                output.append("Trade Breakdown:")
+                output.append(f"  Long Trades: {long_count}")
+                output.append(f"  Short Trades: {short_count}")
+                
+                # Calculate profits for long and short trades if available
+                long_profit = 0.0
+                short_profit = 0.0
+                
+                # Check if we have trade data with profit information
+                if custom_long_trades:
+                    long_trades_with_profit = [t for t in custom_long_trades if len(t) > 3]
+                    if long_trades_with_profit:
+                        long_profit = sum(t[3] for t in long_trades_with_profit)
+                        output.append(f"  Long Trade Profit: ${long_profit:.2f}")
+                
+                if custom_short_trades:
+                    short_trades_with_profit = [t for t in custom_short_trades if len(t) > 3]
+                    if short_trades_with_profit:
+                        short_profit = sum(t[3] for t in short_trades_with_profit)
+                        output.append(f"  Short Trade Profit: ${short_profit:.2f}")
+            
             output.append("Trade Log:")
             for trade in custom_trades:
-                action, date, price = trade
-                output.append(f"{action} on {date.strftime('%Y-%m-%d')} at ${price:.2f}")
+                # Handle trade tuples which may have 3 or 4 elements
+                if len(trade) >= 3:
+                    action, date, price = trade[:3]
+                    output.append(f"{action} on {date.strftime('%Y-%m-%d')} at ${price:.2f}")
         
         # Hide progress bar and restore run button when complete
         if root is not None and progress_bar is not None and run_button is not None:
@@ -492,7 +692,7 @@ def create_heatmap_window(root, data, title, value_label, cmap=None, bounds=None
                     detail_text += f"Long Moving Average: {long_ma} days\n"
                     
                     if "Gain" in title:
-                        detail_text += f"Annualized Gain: {value:.2f}%\n"
+                        detail_text += f"Annualized %Gain: {value:.2f}%\n"
                         # Try to get trade count data
                         try:
                             trade_count_table = pd.read_csv("trade_count_table.csv", index_col=0)
@@ -508,7 +708,7 @@ def create_heatmap_window(root, data, title, value_label, cmap=None, bounds=None
                             gain_table = pd.read_csv("annualized_gain_table.csv", index_col=0)
                             gain = gain_table.iloc[row, col]
                             if not np.isnan(gain):
-                                detail_text += f"Annualized Gain: {gain:.2f}%\n"
+                                detail_text += f"Annualized %Gain: {gain:.2f}%\n"
                         except:
                             pass
                     
@@ -527,6 +727,886 @@ def create_heatmap_window(root, data, title, value_label, cmap=None, bounds=None
     heatmap_window.focus_force()
     
     return heatmap_window
+
+def show_price_chart(file_path, start_date, end_date):
+    """
+    Opens a new window showing a price chart for the specified date range with moving averages
+    """
+    # We need access to global variables for the controls in this function
+    global allow_short_selling_var, short_sell_only_var, include_slope_check_var, slope_lookback_var, file_path_var, all_trades
+    global trades_count_var, long_trades_var, short_trades_var, annualized_gain_var
+    
+    # Initialize slope check variables if they don't exist
+    if 'include_slope_check_var' not in globals():
+        global include_slope_check_var
+        include_slope_check_var = tk.BooleanVar(value=False)
+    
+    if 'slope_lookback_var' not in globals():
+        global slope_lookback_var
+        slope_lookback_var = tk.IntVar(value=3)  # Default lookback period is 3 days
+    
+    if not file_path or not start_date or not end_date:
+        messagebox.showerror("Missing Input", "Please select a file and provide start and end dates.")
+        return
+    
+    try:
+        # Load data
+        df = load_data(file_path)
+        if df is None:
+            return
+        
+        # Convert dates
+        start_date = pd.to_datetime(start_date)
+        end_date = pd.to_datetime(end_date)
+        
+        # Filter data for the specified date range
+        filtered_df = df[(df['Date'] >= start_date) & (df['Date'] <= end_date)]
+        
+        if filtered_df.empty:
+            messagebox.showerror("Error", "No data found in the specified date range.")
+            return
+        
+        # Create a new window
+        chart_window = tk.Toplevel()
+        chart_window.title("Price Chart with Moving Averages")
+        chart_window.state('zoomed')  # Maximize the window by default
+        
+        # Create main frame
+        main_frame = tk.Frame(chart_window)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create chart frame on the left
+        chart_frame = tk.Frame(main_frame)
+        chart_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Create a frame with scrollbar for controls
+        controls_container = tk.Frame(main_frame)
+        controls_container.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Add scrollbar to the controls container
+        controls_scroll = tk.Scrollbar(controls_container, orient=tk.VERTICAL)
+        controls_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Create canvas for scrolling
+        controls_canvas = tk.Canvas(controls_container, width=375, bg='#f0f0f0', 
+                                   yscrollcommand=controls_scroll.set)
+        controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        controls_scroll.config(command=controls_canvas.yview)
+        
+        # Create controls frame on the right (increased width from 250 to 375)
+        controls_frame = tk.Frame(controls_canvas, width=375, padx=15, pady=15, bg='#f0f0f0')
+        controls_canvas.create_window((0, 0), window=controls_frame, anchor=tk.NW, width=375)
+        
+        # Update the scrollregion when the size of the frame changes
+        def update_scrollregion(event):
+            controls_canvas.configure(scrollregion=controls_canvas.bbox(tk.ALL))
+        
+        # Function to handle mousewheel scrolling
+        def on_mousewheel(event):
+            controls_canvas.yview_scroll(-1 * int(event.delta/120), "units")
+        
+        # Bind events for scrolling
+        controls_frame.bind("<Configure>", update_scrollregion)
+        controls_canvas.bind_all("<MouseWheel>", on_mousewheel)
+        
+        # Add controls for moving averages
+        tk.Label(controls_frame, text="Moving Averages", font=("Arial", 14, "bold"), bg='#f0f0f0').pack(pady=(0, 10))
+        
+        # Short MA control with frame
+        short_ma_frame = tk.Frame(controls_frame, bg='#f0f0f0')
+        short_ma_frame.pack(fill=tk.X, pady=(10, 0))
+        tk.Label(short_ma_frame, text="Short Moving Average:", bg='#f0f0f0').pack(anchor='w')
+        short_ma_var = tk.StringVar(value="50")
+        short_ma_entry = tk.Entry(short_ma_frame, textvariable=short_ma_var, width=10, font=("Arial", 10))
+        short_ma_entry.pack(pady=(0, 10), anchor='w')
+        
+        # Long MA control with frame
+        long_ma_frame = tk.Frame(controls_frame, bg='#f0f0f0')
+        long_ma_frame.pack(fill=tk.X, pady=(5, 0))
+        tk.Label(long_ma_frame, text="Long Moving Average:", bg='#f0f0f0').pack(anchor='w')
+        long_ma_var = tk.StringVar(value="150")
+        long_ma_entry = tk.Entry(long_ma_frame, textvariable=long_ma_var, width=10, font=("Arial", 10))
+        long_ma_entry.pack(side=tk.LEFT, pady=(0, 5))
+        
+        # Function to update the chart with moving averages and buy/sell signals
+        def update_chart():
+            global file_path_var, allow_short_selling_var, short_sell_only_var, include_slope_check_var, slope_lookback_var
+            global trades_count_var, long_trades_var, short_trades_var, annualized_gain_var, all_trades
+            ax.clear()
+            
+            # Get MA values
+            try:
+                short_ma = int(short_ma_var.get())
+                long_ma = int(long_ma_var.get())
+                
+                if short_ma <= 0 or long_ma <= 0:
+                    messagebox.showerror("Error", "Moving average periods must be positive integers.")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Moving average periods must be positive integers.")
+                return
+                
+            # Check if slope check is enabled
+            try:
+                include_slope_check = include_slope_check_var.get() if 'include_slope_check_var' in globals() else False
+                if include_slope_check:
+                    # Get lookback period from spinbox or use default
+                    lookback = slope_lookback_var.get() if 'slope_lookback_var' in globals() else 3
+            except:
+                include_slope_check = False
+                lookback = 3
+                
+            # Function to calculate annualized gain
+            def calculate_annualized_gain(initial, final, start_date, end_date):
+                num_days = (end_date - start_date).days
+                num_years = num_days / 365.25
+                if num_years > 0 and initial > 0:
+                    return ((final / initial) ** (1 / num_years) - 1) * 100
+                else:
+                    return 0.0
+            
+            # Calculate moving averages
+            df_copy = filtered_df.copy()
+            df_copy['Short_MA'] = df_copy['Price'].rolling(window=short_ma).mean()
+            df_copy['Long_MA'] = df_copy['Price'].rolling(window=long_ma).mean()
+            
+            # Generate buy/sell signals
+            df_copy['Signal'] = 0  # 0: no signal, 1: buy, -1: sell
+            
+            # We need at least one value in both MAs to start
+            if len(df_copy.dropna()) > 0:
+                # Look for crossover points (short MA crosses above long MA = buy, below = sell)
+                for i in range(1, len(df_copy)):
+                    # Skip rows with NaN values
+                    if pd.isna(df_copy['Short_MA'].iloc[i-1]) or pd.isna(df_copy['Long_MA'].iloc[i-1]) or \
+                       pd.isna(df_copy['Short_MA'].iloc[i]) or pd.isna(df_copy['Long_MA'].iloc[i]):
+                        continue
+                        
+                    # Buy signal: Short MA crosses above Long MA
+                    if df_copy['Short_MA'].iloc[i-1] <= df_copy['Long_MA'].iloc[i-1] and \
+                       df_copy['Short_MA'].iloc[i] > df_copy['Long_MA'].iloc[i]:
+                        df_copy.loc[df_copy.index[i], 'Signal'] = 1
+                    
+                    # Sell signal: Short MA crosses below Long MA
+                    elif df_copy['Short_MA'].iloc[i-1] >= df_copy['Long_MA'].iloc[i-1] and \
+                         df_copy['Short_MA'].iloc[i] < df_copy['Long_MA'].iloc[i]:
+                        df_copy.loc[df_copy.index[i], 'Signal'] = -1
+            
+            # Plot the data - price in black, short MA in blue, long MA in green
+            ax.plot(df_copy['Date'], df_copy['Price'], 'k-', label='Price')
+            ax.plot(df_copy['Date'], df_copy['Short_MA'], 'b-', label=f'Short MA ({short_ma})')
+            ax.plot(df_copy['Date'], df_copy['Long_MA'], 'g-', label=f'Long MA ({long_ma})')
+            
+            # Calculate min and max prices for vertical positioning
+            min_price = filtered_df['Price'].min()
+            max_price = filtered_df['Price'].max()
+            
+            # Calculate vertical position for buy/sell markers
+            # We'll place them much further away from the price line to avoid being obscured by any lines
+            price_range = max_price - min_price
+            buy_offset = price_range * 0.08  # 8% of price range above price (doubled from 4%)
+            sell_offset = price_range * 0.08  # 8% of price range below price (doubled from 4%)
+            
+            # Add buy signals (green arrows pointing up)
+            buy_signals = df_copy[df_copy['Signal'] == 1]
+            if not buy_signals.empty:
+                for idx, row in buy_signals.iterrows():
+                    # Place buy markers (green B)
+                    price = row['Price']
+                    marker_y = price + buy_offset  # Place above price
+                    ax.annotate('B', xy=(row['Date'], marker_y),
+                                xytext=(0, 0), textcoords='offset points',
+                                fontsize=12, fontweight='bold', color='green',
+                                horizontalalignment='center', backgroundcolor='white',
+                                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'))
+                    # Add vertical line at buy point
+                    ax.axvline(x=row['Date'], color='green', linestyle='--', alpha=0.3)
+            
+            # Add sell signals (red arrows pointing down)
+            sell_signals = df_copy[df_copy['Signal'] == -1]
+            if not sell_signals.empty:
+                for idx, row in sell_signals.iterrows():
+                    # Place sell markers (red S)
+                    price = row['Price'] 
+                    marker_y = price - sell_offset  # Place below price
+                    ax.annotate('S', xy=(row['Date'], marker_y),
+                                xytext=(0, 0), textcoords='offset points',
+                                fontsize=12, fontweight='bold', color='red',
+                                horizontalalignment='center', backgroundcolor='white',
+                                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'))
+                    # Add vertical line at sell point
+                    ax.axvline(x=row['Date'], color='red', linestyle='--', alpha=0.3)
+            
+            # Format the x-axis to show dates properly
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            fig.autofmt_xdate()  # Rotates and formats date labels
+            
+            # Add labels and title
+            ax.set_xlabel('Date')
+            ax.set_ylabel('Price')
+            ax.set_title(f'Price Chart with Buy/Sell Signals ({start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")})')
+            
+            # Set y-axis range based on the min and max values with even more padding for signals
+            # Add 12% padding (increased from 8%)
+            padding = (max_price - min_price) * 0.12
+            ax.set_ylim(min_price - padding*3.0, max_price + padding*3.0)  # Further increased padding for buy/sell markers
+            
+            # Add grid
+            ax.grid(True, alpha=0.3)
+            
+            # Create a clean, simple legend for lines only
+            # This avoids any issues with the Buy/Sell signals in the legend
+            legend = ax.legend(
+                ['Price', f'Short MA ({short_ma})', f'Long MA ({long_ma})'],
+                loc='upper left',
+                fontsize='small',
+                frameon=True,
+                fancybox=True
+            )
+            
+            # Calculate strategy performance metrics for display
+            # Calculate wealth and trade count
+            initial_investment = 10000  # Standard initial investment
+            
+            # First, find valid signals (non-NaN)
+            valid_df = df_copy.dropna()
+            
+            # Count buy and sell signals
+            buy_signals_count = len(valid_df[valid_df['Signal'] == 1])
+            sell_signals_count = len(valid_df[valid_df['Signal'] == -1])
+            total_signals = buy_signals_count + sell_signals_count
+            
+            # Get short selling options
+            allow_short_selling = allow_short_selling_var.get()
+            short_sell_only = short_sell_only_var.get() if allow_short_selling else False
+            
+            # Track trades for detailed statistics
+            long_trade_count = 0
+            short_trade_count = 0
+            
+            # Update the trades count displays
+            trades_count_var.set(f"{total_signals}")
+            
+            # Update long and short trade counts based on strategy options
+            if short_sell_only:
+                long_trade_count = 0
+                short_trade_count = sell_signals_count
+                long_trades_var.set("0 (disabled)")
+            else:
+                long_trade_count = buy_signals_count
+                short_trade_count = sell_signals_count if allow_short_selling else 0
+                long_trades_var.set(f"{long_trade_count}")
+            
+            short_trades_var.set(f"{short_trade_count}" if allow_short_selling else "0 (disabled)")
+            
+            # Simulate trading to calculate performance
+            if len(valid_df) > 0:
+                # Get the first and last valid dates
+                first_date = valid_df['Date'].iloc[0]
+                last_date = valid_df['Date'].iloc[-1]
+                
+                # Run trading simulation based on signals
+                cash = initial_investment
+                shares = 0
+                position = 0  # 0: no position, 1: long position, -1: short position
+                short_entry_price = 0  # Price at which short position was entered
+                
+                # Get short selling options
+                allow_short_selling = allow_short_selling_var.get()
+                short_sell_only = short_sell_only_var.get() if allow_short_selling else False
+                
+                for i in range(len(valid_df)):
+                    signal = valid_df['Signal'].iloc[i]
+                    price = valid_df['Price'].iloc[i]
+                    
+                    # Long trades (Buy signal opens, Sell signal closes)
+                    if not short_sell_only and signal == 1 and (position == 0 or (allow_short_selling and position == -1)):
+                        if position == -1:  # Close short position if exists
+                            profit = shares * (short_entry_price - price)  # Profit from short trade
+                            cash += profit + shares * short_entry_price  # Return initial investment plus profit
+                            shares = 0
+                            position = 0
+                        
+                        # Open long position
+                        shares = cash / price
+                        cash = 0
+                        position = 1
+                    
+                    # Sell signal - close long or open short
+                    elif signal == -1:
+                        if position == 1:  # Close long position
+                            cash = shares * price
+                            shares = 0
+                            position = 0
+                        
+                        # If short selling is allowed and we don't have a position, open a short position
+                        if allow_short_selling and position == 0:
+                            shares = cash / price  # Number of shares to short
+                            short_entry_price = price
+                            position = -1
+                            cash = 0  # Cash is held as collateral
+                
+                # Close any open position at the end
+                final_price = valid_df['Price'].iloc[-1]
+                if position == 1:  # Long position
+                    cash = shares * final_price
+                elif position == -1:  # Short position
+                    profit = shares * (short_entry_price - final_price)
+                    cash += profit + shares * short_entry_price
+                
+                # Calculate final wealth and annualized gain
+                final_wealth = cash
+                annualized_gain = calculate_annualized_gain(initial_investment, final_wealth, first_date, last_date)
+                
+                # Update the annualized gain display
+                annualized_gain_var.set(f"{annualized_gain:.2f}%")
+            else:
+                # No valid data for calculation
+                annualized_gain_var.set("N/A")
+                
+            # Now gather trade information and update the trade list
+            # First, reset the all_trades list
+            global all_trades
+            all_trades = []  # Create a new list rather than just clearing it
+            
+            # Collect all trades based on signals
+            allow_short = allow_short_selling_var.get()
+            short_only = short_sell_only_var.get() if allow_short else False
+            
+            position = 0  # 0: no position, 1: long, -1: short
+            
+            # Process each signal to create trade entries
+            for i in range(len(valid_df)):
+                signal = valid_df['Signal'].iloc[i]
+                date = valid_df['Date'].iloc[i]
+                price = valid_df['Price'].iloc[i]
+                
+                # Buy signal
+                if signal == 1:
+                    if not short_only and (position == 0 or (allow_short and position == -1)):
+                        if position == -1:
+                            # Cover short before buying
+                            all_trades.append(('Cover Short', date, price))
+                        # Open long position
+                        all_trades.append(('Buy', date, price))
+                        position = 1
+                
+                # Sell signal
+                elif signal == -1:
+                    if position == 1:
+                        # Close long position
+                        all_trades.append(('Sell', date, price))
+                        position = 0
+                    
+                    if allow_short and position == 0:
+                        # Open short position
+                        all_trades.append(('Short Sell', date, price))
+                        position = -1
+                        
+            # Update the trade list display
+            trades_text.config(state=tk.NORMAL)  # Enable editing
+            trades_text.delete(1.0, tk.END)  # Clear current content
+            
+            if all_trades:
+                # Display a limited number of most recent trades (last 5)
+                display_trades = all_trades[-5:] if len(all_trades) > 5 else all_trades
+                for trade in display_trades:
+                    action, date, price = trade[:3]
+                    # Reduce action width from 15 to 8 characters
+                    trades_text.insert(tk.END, f"{action:<8} {date.strftime('%Y-%m-%d')}  ${price:.2f}\n")
+                
+                if len(all_trades) > 5:
+                    trades_text.insert(tk.END, f"\n... and {len(all_trades) - 5} more trades")
+            else:
+                trades_text.insert(tk.END, "No trades to display")
+            
+            trades_text.config(state=tk.DISABLED)  # Make it read-only again
+            
+            # Update the canvas
+            fig.tight_layout()
+            canvas.draw()
+        
+        # Add update button next to the moving averages
+        update_button = tk.Button(long_ma_frame, text="Update Chart", command=update_chart, 
+                                 bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), padx=5, pady=1)
+        update_button.pack(side=tk.RIGHT, padx=5, pady=(0, 5))
+        
+        # Add signal explanation - more compact layout
+        signal_frame = tk.Frame(controls_frame, bg='#f0f0f0', relief=tk.GROOVE, bd=1)
+        signal_frame.pack(fill=tk.X, pady=5)
+        tk.Label(signal_frame, text="Signal Legend", font=("Arial", 10, "bold"), bg='#f0f0f0').pack(pady=3)
+        
+        # Add a green line for Buy signals
+        buy_frame = tk.Frame(signal_frame, bg='#f0f0f0')
+        buy_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Create a colored line to represent the Buy signal
+        buy_line_canvas = tk.Canvas(buy_frame, width=15, height=15, bg='#f0f0f0', highlightthickness=0)
+        buy_line_canvas.pack(side=tk.LEFT)
+        buy_line_canvas.create_line(2, 7, 13, 7, fill="green", width=2)
+        
+        # Add the letter B
+        tk.Label(buy_frame, text="B", font=("Arial", 12, "bold"), fg="green", bg='#f0f0f0').pack(side=tk.LEFT, padx=2)
+        
+        # Add explanation text
+        tk.Label(buy_frame, text="= Buy (Short MA crosses above Long MA)", bg='#f0f0f0').pack(side=tk.LEFT, padx=5)
+        
+        # Add a red line for Sell signals
+        sell_frame = tk.Frame(signal_frame, bg='#f0f0f0')
+        sell_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Create a colored line to represent the Sell signal
+        sell_line_canvas = tk.Canvas(sell_frame, width=15, height=15, bg='#f0f0f0', highlightthickness=0)
+        sell_line_canvas.pack(side=tk.LEFT)
+        sell_line_canvas.create_line(2, 7, 13, 7, fill="red", width=2)
+        
+        # Add the letter S
+        tk.Label(sell_frame, text="S", font=("Arial", 12, "bold"), fg="red", bg='#f0f0f0').pack(side=tk.LEFT, padx=2)
+        
+        # Add explanation text
+        tk.Label(sell_frame, text="= Sell (Short MA crosses below Long MA)", bg='#f0f0f0').pack(side=tk.LEFT, padx=5)
+        
+        # Create the figure - reduced size to leave more room for the wider controls panel
+        fig = plt.Figure(figsize=(8, 5.5), dpi=100)
+        ax = fig.add_subplot(111)
+        
+        # Embed the plot in the Tkinter window
+        canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize chart with default values
+        update_chart()
+    
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to create chart: {str(e)}")
+
+def show_price_chart():
+    """Shows a price chart with buy/sell signals in a separate window"""
+    global filtered_df, all_trades, include_slope_check_var, slope_lookback_var
+    
+    # Create a new top-level window
+    chart_window = tk.Toplevel()
+    chart_window.title("Price Chart with Buy/Sell Signals")
+    chart_window.geometry("1200x800")
+
+    # Create variables for short selling options
+    allow_short_selling_var = tk.BooleanVar(value=False)
+    short_sell_only_var = tk.BooleanVar(value=False)
+        
+        # Add the short sell only checkbox (initially hidden) - renamed for clarity
+        short_sell_only_cb = tk.Checkbutton(short_selling_frame, text="Suppress Long Trades",
+                                          variable=short_sell_only_var,
+                                          onvalue=True, offvalue=False,
+                                          command=update_chart,  # Update chart when this changes
+                                          bg='#f0f0f0')
+                                          
+        # Add a frame for slope options
+        slope_frame = tk.Frame(short_selling_frame, bg='#f0f0f0')
+        slope_frame.pack(pady=5, fill=tk.X)
+        
+        # Add the include slope check checkbox
+        include_slope_check_cb = tk.Checkbutton(slope_frame, text="Include Slope Check",
+                                          variable=include_slope_check_var,
+                                          onvalue=True, offvalue=False,
+                                          command=update_chart,  # Update chart when this changes
+                                          bg='#f0f0f0')
+        include_slope_check_cb.pack(side=tk.LEFT, padx=(20, 5))
+        
+        # Add a label for the lookback period
+        tk.Label(slope_frame, text="Lookback:", bg='#f0f0f0').pack(side=tk.LEFT)
+        
+        # Add a spinbox for the lookback period
+        lookback_spinbox = tk.Spinbox(slope_frame, from_=1, to=10, width=3, 
+                                     textvariable=slope_lookback_var, 
+                                     command=lambda: update_chart() if include_slope_check_var.get() else None)
+        lookback_spinbox.pack(side=tk.LEFT, padx=5)
+        
+        # Create a frame for displaying statistics - more compact layout
+        stats_frame = tk.Frame(controls_frame, bg='#f0f0f0', relief=tk.GROOVE, bd=1)
+        stats_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        # Add a heading for the statistics section - smaller font
+        tk.Label(stats_frame, text="Strategy Performance", font=("Arial", 10, "bold"), 
+                bg='#f0f0f0').pack(pady=(3, 0))
+        
+        # Create variables for the stats that will be updated
+        annualized_gain_var = tk.StringVar(value="---.--")
+        trades_count_var = tk.StringVar(value="--")
+        long_trades_var = tk.StringVar(value="--")
+        short_trades_var = tk.StringVar(value="--")
+        
+        # Add Annualized %Gain display
+        gain_frame = tk.Frame(stats_frame, bg='#f0f0f0')
+        gain_frame.pack(fill=tk.X, padx=10, pady=2)
+        tk.Label(gain_frame, text="Annualized %Gain:", bg='#f0f0f0', 
+                font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        tk.Label(gain_frame, textvariable=annualized_gain_var, bg='#f0f0f0', 
+                fg="#0066cc", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        
+        # Add Total Number of Trades display
+        trades_frame = tk.Frame(stats_frame, bg='#f0f0f0')
+        trades_frame.pack(fill=tk.X, padx=10, pady=2)
+        tk.Label(trades_frame, text="Number of Trades:", bg='#f0f0f0',
+                font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        tk.Label(trades_frame, textvariable=trades_count_var, bg='#f0f0f0',
+                fg="#0066cc", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        
+        # Add Long Trades display
+        long_trades_frame = tk.Frame(stats_frame, bg='#f0f0f0')
+        long_trades_frame.pack(fill=tk.X, padx=10, pady=2)
+        tk.Label(long_trades_frame, text="Long Trades:", bg='#f0f0f0',
+                font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        tk.Label(long_trades_frame, textvariable=long_trades_var, bg='#f0f0f0',
+                fg="#006600", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        
+        # Add Short Trades display
+        short_trades_frame = tk.Frame(stats_frame, bg='#f0f0f0')
+        short_trades_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+        tk.Label(short_trades_frame, text="Short Trades:", bg='#f0f0f0',
+                font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        tk.Label(short_trades_frame, textvariable=short_trades_var, bg='#f0f0f0',
+                fg="#990000", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        
+        # Add a frame for displaying recent trades - more compact layout
+        trades_list_frame = tk.Frame(controls_frame, bg='#f0f0f0', relief=tk.GROOVE, bd=1)
+        trades_list_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        # Add a title for the trades list - smaller font
+        tk.Label(trades_list_frame, text="Recent Trades", font=("Arial", 10, "bold"), 
+                bg='#f0f0f0').pack(pady=(3, 1))
+        
+        # Create a frame for the trade entries with reduced height to ensure button visibility
+        trade_entries_frame = tk.Frame(trades_list_frame, bg='#f0f0f0', height=100)
+        trade_entries_frame.pack(fill=tk.X, padx=10, pady=3)
+        
+        # Variable to store all trades for the detailed view
+        all_trades = []
+        
+        # Create a frame to hold text and scrollbar side by side
+        text_scroll_frame = tk.Frame(trade_entries_frame, bg='#f0f0f0')
+        text_scroll_frame.pack(fill=tk.X, expand=True)
+        
+        # Create a Text widget to display recent trades (limited to a few)
+        trades_text = tk.Text(text_scroll_frame, height=5, width=45, font=("Courier", 10),
+                             bg='#f5f5f5', relief=tk.SUNKEN, bd=1)
+        trades_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Add vertical scrollbar
+        trades_scrollbar = tk.Scrollbar(text_scroll_frame, orient=tk.VERTICAL, command=trades_text.yview)
+        trades_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        trades_text.config(yscrollcommand=trades_scrollbar.set)
+        
+        trades_text.insert(tk.END, "No trades to display")
+        trades_text.config(state=tk.DISABLED)  # Make it read-only
+        
+        # Function to display the full list of trades in a new window
+        def show_detailed_trades():
+            # Import the improved function
+            from improved_detailed_trade_list import show_detailed_trades as improved_show_detailed_trades
+            
+            if not all_trades:
+                messagebox.showinfo("No Trades", "No trades available for the current settings.")
+                return
+            
+            # Call the improved function with all necessary parameters
+            improved_show_detailed_trades(
+                all_trades=all_trades,
+                filtered_df=filtered_df, 
+                trades_count_var=trades_count_var,
+                long_trades_var=long_trades_var, 
+                short_trades_var=short_trades_var,
+                annualized_gain_var=annualized_gain_var,
+                short_ma_var=short_ma_var,
+                long_ma_var=long_ma_var,
+                include_slope_check_var=include_slope_check_var if 'include_slope_check_var' in globals() else None,
+                slope_lookback_var=slope_lookback_var if 'slope_lookback_var' in globals() else None
+            )
+        
+        # Add a button to view detailed trades
+        detailed_btn = tk.Button(trade_entries_frame, text="View All Trades", command=show_detailed_trades,
+                                bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), padx=5, pady=1)
+        detailed_btn.pack(pady=5)
+        
+        # Create layout for the chart
+        chart_frame = tk.Frame(chart_window, padx=5, pady=5)
+        chart_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+            
+            # Add a title
+            tk.Label(main_frame, text="Complete Trade History", 
+                    font=("Arial", 14, "bold")).pack(pady=(0, 10))
+            
+            # Create a frame with scrollbar for the trades list
+            list_frame = tk.Frame(main_frame)
+            list_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Add scrollbars
+            v_scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
+            v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            h_scrollbar = tk.Scrollbar(list_frame, orient=tk.HORIZONTAL)
+            h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+            
+            # Create a text widget with scrollbars for the trades
+            trades_detail = tk.Text(list_frame, font=("Courier", 10), wrap=tk.NONE,
+                                  yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+            trades_detail.pack(fill=tk.BOTH, expand=True)
+            
+            # Connect scrollbars to the text widget
+            v_scrollbar.config(command=trades_detail.yview)
+            h_scrollbar.config(command=trades_detail.xview)
+            
+            # Determine if slope check is enabled
+            try:
+                slope_check_enabled = include_slope_check_var.get() if 'include_slope_check_var' in globals() else False
+            except:
+                slope_check_enabled = False
+            
+            # Function to look up MA values for a specific date
+            def get_ma_values(date):
+                if df_with_ma is None:
+                    return (float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), float('nan'))
+                
+                # Find this date in the dataframe
+                trade_row = df_with_ma[df_with_ma['Date'] == date]
+                
+                if not trade_row.empty:
+                    short_ma = trade_row['Short_MA'].values[0]
+                    long_ma = trade_row['Long_MA'].values[0]
+                    
+                    # Get previous day's values if possible
+                    idx = df_with_ma.index[df_with_ma['Date'] == date].tolist()
+                    if idx and idx[0] > 0:
+                        prev_row = df_with_ma.iloc[idx[0] - 1]
+                        prev_short_ma = prev_row['Short_MA'] 
+                        prev_long_ma = prev_row['Long_MA']
+                    else:
+                        prev_short_ma = float('nan')
+                        prev_long_ma = float('nan')
+                    
+                    # Get slope values if enabled
+                    if slope_check_enabled:
+                        if 'Short_MA_Slope' in trade_row.columns:
+                            short_slope = trade_row['Short_MA_Slope'].values[0]
+                            long_slope = trade_row['Long_MA_Slope'].values[0]
+                        else:
+                            # Default values if not calculated
+                            short_slope = float('nan')
+                            long_slope = float('nan')
+                    else:
+                        short_slope = float('nan')
+                        long_slope = float('nan')
+                
+                    return (short_ma, long_ma, prev_short_ma, prev_long_ma, short_slope, long_slope)
+                else:
+                    return (float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), float('nan'))
+            
+            # Add column headers with expanded information
+            header = "Action          Date            Price      "
+            header += "Short MA    Long MA     "
+            header += "Prev Short  Prev Long   "
+            
+            if slope_check_enabled:
+                header += "Short Slope Long Slope  "
+            
+            header += "% Gain/Loss"
+            trades_detail.insert(tk.END, header + "\n")
+            
+            # Add a separator line matching the header width
+            separator = "-" * len(header)
+            trades_detail.insert(tk.END, separator + "\n")
+            
+            # Add all trades to the text widget with position tracking for better context
+            position = 0  # 0: no position, 1: long position, -1: short position
+            last_action = None
+            entry_price = 0  # Track entry price for calculating gain/loss
+            entry_date = None  # Track entry date
+            
+            for i, trade in enumerate(all_trades):
+                action, date, price = trade[:3]
+                
+                # Get MA values for this date
+                short_ma, long_ma, prev_short_ma, prev_long_ma, short_slope, long_slope = get_ma_values(date)
+                
+                # Calculate gain/loss for closing trades
+                gain_loss = "N/A"
+                if (action == "Sell" and last_action == "Buy") or (action == "Cover Short" and last_action == "Short Sell"):
+                    if entry_price > 0:
+                        if action == "Sell":
+                            pct_gain = ((price - entry_price) / entry_price) * 100
+                        else:  # Cover Short
+                            pct_gain = ((entry_price - price) / entry_price) * 100
+                        gain_loss = f"{pct_gain:+.2f}%" if not np.isnan(pct_gain) else "N/A"
+                
+                # Format MA values and slopes
+                short_ma_str = f"{short_ma:.2f}" if not np.isnan(short_ma) else "N/A"
+                long_ma_str = f"{long_ma:.2f}" if not np.isnan(long_ma) else "N/A"
+                prev_short_str = f"{prev_short_ma:.2f}" if not np.isnan(prev_short_ma) else "N/A"
+                prev_long_str = f"{prev_long_ma:.2f}" if not np.isnan(prev_long_ma) else "N/A"
+                
+                # Format slope values if enabled
+                if slope_check_enabled:
+                    short_slope_str = f"{short_slope:.4f}" if not np.isnan(short_slope) else "N/A"
+                    long_slope_str = f"{long_slope:.4f}" if not np.isnan(long_slope) else "N/A"
+                    slope_info = f"{short_slope_str:<11} {long_slope_str:<11} "
+                else:
+                    slope_info = ""
+                
+                # Build the row with all the data
+                trade_line = f"{action:<15} {date.strftime('%Y-%m-%d'):<15} ${price:<9.2f} "
+                trade_line += f"{short_ma_str:<11} {long_ma_str:<11} "
+                trade_line += f"{prev_short_str:<11} {prev_long_str:<11} "
+                trade_line += slope_info
+                trade_line += f"{gain_loss:<10}"
+                
+                # Add position information for context
+                position_info = ""
+                
+                if action == "Buy":
+                    position = 1
+                    entry_price = price
+                    entry_date = date
+                    position_info = "(Opening long position)"
+                    tag = "buy"
+                elif action == "Sell":
+                    position = 0
+                    # Check if this closes a long position
+                    if last_action == "Buy":
+                        position_info = "(Closing long position)"
+                    else:
+                        position_info = "(Selling)"
+                    tag = "sell"
+                    entry_price = 0
+                elif action == "Short Sell":
+                    position = -1
+                    entry_price = price
+                    entry_date = date
+                    position_info = "(Opening short position)"
+                    tag = "short"
+                elif action == "Cover Short":
+                    position = 0
+                    position_info = "(Closing short position)"
+                    tag = "cover"
+                    entry_price = 0
+                else:
+                    tag = ""
+                
+                # Insert the line with appropriate color
+                trades_detail.insert(tk.END, trade_line + f" {position_info}\n", tag)
+                
+                last_action = action
+            
+            # If this is the last trade and position is not 0, add a simulated closing trade
+            if position != 0:
+                # Get the final price from the dataframe
+                final_price = df_with_ma['Price'].iloc[-1] if df_with_ma is not None and not df_with_ma.empty else 0
+                final_date = df_with_ma['Date'].iloc[-1] if df_with_ma is not None and not df_with_ma.empty else None
+                
+                if final_date is not None:
+                    # Get MA values for final date
+                    short_ma, long_ma, prev_short_ma, prev_long_ma, short_slope, long_slope = get_ma_values(final_date)
+                    
+                    # Calculate gain/loss
+                    if entry_price > 0:
+                        if position == 1:  # Long position
+                            pct_gain = ((final_price - entry_price) / entry_price) * 100
+                        else:  # Short position
+                            pct_gain = ((entry_price - final_price) / entry_price) * 100
+                        gain_loss = f"{pct_gain:+.2f}%" if not np.isnan(pct_gain) else "N/A"
+                    
+                    # Format MA values
+                    short_ma_str = f"{short_ma:.2f}" if not np.isnan(short_ma) else "N/A"
+                    long_ma_str = f"{long_ma:.2f}" if not np.isnan(long_ma) else "N/A"
+                    prev_short_str = f"{prev_short_ma:.2f}" if not np.isnan(prev_short_ma) else "N/A"
+                    prev_long_str = f"{prev_long_ma:.2f}" if not np.isnan(prev_long_ma) else "N/A"
+                    
+                    # Format slope values if enabled
+                    if slope_check_enabled:
+                        short_slope_str = f"{short_slope:.4f}" if not np.isnan(short_slope) else "N/A"
+                        long_slope_str = f"{long_slope:.4f}" if not np.isnan(long_slope) else "N/A"
+                        slope_info = f"{short_slope_str:<11} {long_slope_str:<11} "
+                    else:
+                        slope_info = ""
+                    
+                    # Add a simulated closing trade
+                    action = "Sell*" if position == 1 else "Cover Short*"
+                    
+                    # Build the row with all the data
+                    trade_line = f"{action:<15} {final_date.strftime('%Y-%m-%d'):<15} ${final_price:<9.2f} "
+                    trade_line += f"{short_ma_str:<11} {long_ma_str:<11} "
+                    trade_line += f"{prev_short_str:<11} {prev_long_str:<11} "
+                    trade_line += slope_info
+                    trade_line += f"{gain_loss:<10}"
+                    
+                    position_info = "(Simulated closing trade)"
+                    
+                    # Use appropriate tag color
+                    tag = "sell" if position == 1 else "cover"
+                    trades_detail.insert(tk.END, trade_line + f" {position_info}\n", tag)
+                    
+                    # Add note explaining the asterisk
+                    trades_detail.insert(tk.END, f"\n* Position was closed at final price to calculate annual gain/loss.\n", "note")
+            
+            # Add a header explaining the trade pairs (moved from top to here)
+            trades_detail.insert(tk.END, "\n\nNote: Trades typically occur in pairs:\n", "note")
+            trades_detail.insert(tk.END, "- Buy → Sell (for long trades)\n", "note")
+            trades_detail.insert(tk.END, "- Short Sell → Cover Short (for short trades)\n", "note")
+            
+            # Add a summary section to explain the relationship between trades and performance
+            trades_detail.insert(tk.END, "\n--------------------------------------\n", "header")
+            trades_detail.insert(tk.END, "SUMMARY\n", "header")
+            trades_detail.insert(tk.END, "--------------------------------------\n", "header")
+            
+            # Get the current values from the strategy performance display
+            trades_detail.insert(tk.END, f"Total Trades: {trades_count_var.get()}\n", "summary")
+            trades_detail.insert(tk.END, f"Long Trades: {long_trades_var.get()}\n", "summary")
+            trades_detail.insert(tk.END, f"Short Trades: {short_trades_var.get()}\n", "summary")
+            trades_detail.insert(tk.END, f"Annualized Gain: {annualized_gain_var.get()}\n\n", "summary")
+            
+            # Add explanation about trade counts and display
+            trades_detail.insert(tk.END, "NOTE ABOUT TRADE COUNTS:\n", "note")
+            trades_detail.insert(tk.END, "The 'Recent Trades' section in the main window only shows a \n", "note")
+            trades_detail.insert(tk.END, "selection of trades - typically the first and last few trades \n", "note")
+            trades_detail.insert(tk.END, "for context. This can make it appear that there are fewer trades \n", "note")
+            trades_detail.insert(tk.END, "than indicated by the strategy performance metrics.\n\n", "note")
+            
+            trades_detail.insert(tk.END, "This detailed view shows ALL trades that occurred during the simulation.\n", "note")
+            trades_detail.insert(tk.END, "The performance metrics are calculated based on ALL trades, not just \n", "note")
+            trades_detail.insert(tk.END, "the ones shown in the 'Recent Trades' section.\n", "note")
+            
+            # Configure tags for colors
+            trades_detail.tag_configure("buy", foreground="green")
+            trades_detail.tag_configure("sell", foreground="red")
+            trades_detail.tag_configure("short", foreground="purple")
+            trades_detail.tag_configure("cover", foreground="blue") 
+            trades_detail.tag_configure("note", foreground="gray", font=("Arial", 9, "italic"))
+            trades_detail.tag_configure("header", font=("Arial", 10, "bold"))
+            trades_detail.tag_configure("summary", font=("Arial", 10))
+            
+            # Make it read-only
+            trades_detail.config(state=tk.DISABLED)
+            
+            # Add a close button
+            tk.Button(main_frame, text="Close", command=trades_window.destroy, 
+                     width=15, bg="#f0f0f0").pack(pady=10)
+        
+        # Add a button frame to ensure button is always visible
+        button_frame = tk.Frame(trades_list_frame, bg='#f0f0f0')
+        button_frame.pack(fill=tk.X, pady=2)
+        
+        # Add a button to show detailed trades - more compact styling
+        more_button = tk.Button(button_frame, text="View All Trades", command=show_detailed_trades,
+                              width=15, font=("Arial", 8), padx=2, pady=1)
+        more_button.pack()
+        
+        # Embed the plot in the Tkinter window
+        canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize chart with default values
+        update_chart()
+        
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to create chart: {str(e)}")
 
 def launch_gui():
     root = tk.Tk()
@@ -563,7 +1643,7 @@ def launch_gui():
             try:
                 gain_table = pd.read_csv("annualized_gain_table.csv", index_col=0)
             except Exception as e:
-                messagebox.showerror("Error", f"Could not load annualized gain data: {e}")
+                messagebox.showerror("Error", f"Could not load annualized %gain data: {e}")
                 return
             
         # Define color bins and colormap
@@ -575,8 +1655,8 @@ def launch_gui():
         heatmap_window = create_heatmap_window(
             root=root, 
             data=gain_table, 
-            title="Annualized Gain Heatmap", 
-            value_label="Annualized Gain", 
+            title="Annualized %Gain Heatmap", 
+            value_label="Annualized %Gain", 
             cmap=cmap, 
             bounds=bounds, 
             colors=colors
@@ -595,6 +1675,8 @@ def launch_gui():
     short_max_var = tk.IntVar(value=20)
     long_min_var = tk.IntVar(value=120)
     long_max_var = tk.IntVar(value=170)
+    allow_short_selling_var = tk.BooleanVar(value=False)  # Default is unchecked
+    short_sell_only_var = tk.BooleanVar(value=False)  # Default is unchecked
 
     def browse_file():
         filename = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
@@ -614,6 +1696,14 @@ def launch_gui():
     tk.Entry(root, textvariable=start_date_var, width=20).pack(pady=2)
     tk.Label(root, text="End Date (YYYY-MM-DD):").pack(pady=5)
     tk.Entry(root, textvariable=end_date_var, width=20).pack(pady=2)
+    
+    # Add Chart button frame
+    chart_frame = tk.Frame(root)
+    chart_frame.pack(pady=5)
+    tk.Button(chart_frame, text="Chart", command=lambda: show_price_chart(file_path_var.get(), 
+                                                                     start_date_var.get(), 
+                                                                     end_date_var.get()),
+              width=15).pack()
 
     # Short MA Range with improved layout
     tk.Label(root, text="Short MA Range (min, max):").pack(pady=5)
@@ -629,13 +1719,43 @@ def launch_gui():
     tk.Entry(long_ma_frame, textvariable=long_min_var, width=10).pack(side=tk.LEFT, padx=5)
     tk.Entry(long_ma_frame, textvariable=long_max_var, width=10).pack(side=tk.LEFT, padx=5)
     
+    # Add a frame for the short selling options
+    short_selling_frame = tk.Frame(root)
+    short_selling_frame.pack(pady=10, fill=tk.X)
+    
+    # Function to toggle the visibility of short sell only checkbox
+    def toggle_short_sell_only_visibility():
+        if allow_short_selling_var.get():
+            # Center align the checkbox
+            short_sell_only_cb.pack(pady=2, anchor=tk.CENTER)
+        else:
+            short_sell_only_cb.pack_forget()
+            short_sell_only_var.set(False)  # Reset to unchecked when hidden
+    
+    # Add a label for short selling options
+    short_selling_label = tk.Label(short_selling_frame, text="Short Selling Options:", font=("Arial", 10, "bold"))
+    short_selling_label.pack(pady=(5, 2), anchor=tk.CENTER)
+    
+    # Add the short selling checkbox - center aligned
+    short_selling_cb = tk.Checkbutton(short_selling_frame, text="Allow Short Selling", 
+                                      variable=allow_short_selling_var, 
+                                      onvalue=True, offvalue=False,
+                                      command=toggle_short_sell_only_visibility)
+    short_selling_cb.pack(pady=2, anchor=tk.CENTER)
+    
+    # Add the short sell optimization only checkbox (initially hidden) - renamed for clarity
+    short_sell_only_cb = tk.Checkbutton(short_selling_frame, text="Suppress Long Trades", 
+                                        variable=short_sell_only_var, 
+                                        onvalue=True, offvalue=False)
+    # Don't pack these initially - they will be shown/hidden by toggle_short_sell_only_visibility
+    
     # Create a frame for the buttons and progress bar to ensure consistent layout
     button_frame = tk.Frame(root)
     button_frame.pack(pady=10, fill=tk.X)
     
     # Create inner frame to control button width
     run_inner_frame = tk.Frame(button_frame)
-    run_inner_frame.pack()
+    run_inner_frame.pack(anchor=tk.CENTER)
     
     # Create progress bar widget but don't make it visible yet
     progress_bar = ttk.Progressbar(button_frame, variable=progress_var, maximum=100)
@@ -648,6 +1768,14 @@ def launch_gui():
         short_max = short_max_var.get()
         long_min = long_min_var.get()
         long_max = long_max_var.get()
+        allow_short_selling = allow_short_selling_var.get()
+        short_sell_only = short_sell_only_var.get()
+        
+        # Ensure short_sell_only is only True when allow_short_selling is also True
+        if short_sell_only and not allow_short_selling:
+            short_sell_only = False
+            short_sell_only_var.set(False)
+        
         if not file_path or not start_date or not end_date:
             messagebox.showerror("Missing Input", "Please fill in all fields.")
             return
@@ -658,7 +1786,8 @@ def launch_gui():
         progress_bar.update_idletasks()
         
         # Start analysis in a separate thread
-        threading.Thread(target=run_analysis, args=(file_path, start_date, end_date, short_min, short_max, long_min, long_max, progress_var, root, run_button, progress_bar)).start()
+        threading.Thread(target=run_analysis, args=(file_path, start_date, end_date, short_min, short_max, long_min, long_max, 
+                                                   allow_short_selling, short_sell_only, progress_var, root, run_button, progress_bar)).start()
 
     # Create the Run Analysis button - narrower with width parameter
     run_button = tk.Button(run_inner_frame, text="Run Analysis", command=run, width=20)
@@ -739,6 +1868,15 @@ def launch_gui():
     tk.Button(trades_button_frame, text="Show Trades Heatmap", command=show_trades_heatmap, width=20).pack()
     
     root.mainloop()
+
+# Remove the standalone view_all_trades function since we're using show_detailed_trades inside the show_price_chart function
+    
+    # Add all trades to the text widget
+    trade_count = 0
+    for trade in all_trades:
+        trade_count += 1
+        action, date, price = trade[:3]
+
 
 if __name__ == "__main__":
     launch_gui()
