@@ -1751,13 +1751,13 @@ def cancel_backtest_callback():
                         child.config(text="Cancelling...", state=tk.DISABLED)
                         break
         
-        # Show cancellation message
-        messagebox.showinfo("Cancelling", "Backtest cancellation has been requested. The process will stop at the next check point.")
+        # Popup window removed as requested - cancellation functionality preserved
         
         # Reset the button text after a short delay
         root.after(1000, lambda: reset_cancel_button())
     else:
-        messagebox.showinfo("No Backtest Running", "There is no backtest currently running to cancel.")
+        # Popup window removed as requested - functionality preserved
+        pass
 
 def reset_cancel_button():
     """Reset the cancel button text and state after cancellation."""

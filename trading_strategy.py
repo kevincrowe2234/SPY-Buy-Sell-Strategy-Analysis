@@ -2035,9 +2035,10 @@ class TradingGUI:
         if self.progress_var.get() > 0:
             self.cancel_backtest = True
             self.progress_label.config(text="Cancelling...")
-            messagebox.showinfo("Cancelling", "Backtest cancellation requested")
+            # Popup window removed as requested - cancellation functionality preserved
         else:
-            messagebox.showinfo("No Backtest Running", "No backtest currently running")
+            # Popup window removed as requested - functionality preserved
+            pass
 
     def show_gain_heatmap(self):
         """Show gain heatmap."""
